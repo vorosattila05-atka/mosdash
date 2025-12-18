@@ -71,6 +71,8 @@ def load_stock_df() -> pd.DataFrame:
             st.error(f"A stock_current hiányos, nincs '{col}' oszlop.")
             st.stop()
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
+    df["item_type"] = df["item_type"].astype(str)
+    df["item_name"] = df["item_name"].astype(str)
     return df
 
 def write_stock_df(df: pd.DataFrame) -> None:
@@ -78,12 +80,10 @@ def write_stock_df(df: pd.DataFrame) -> None:
 
 def load_log_df() -> pd.DataFrame:
     df = _df_from_ws(ws_log)
-    # elvárt oszlopok: timestamp,item_name,change,reason,source,source_id
     if df.empty:
         return pd.DataFrame(columns=["timestamp","item_name","change","reason","source","source_id"])
     for col in ["timestamp","item_name","change","reason","source","source_id"]:
         if col not in df.columns:
-            # ha valami hiányzik, hozzuk létre, hogy ne haljon el
             df[col] = ""
     df["change"] = pd.to_numeric(df["change"], errors="coerce").fillna(0).astype(int)
     df["source_id"] = df["source_id"].astype(str)
@@ -109,6 +109,7 @@ def set_setting(key: str, value: str) -> None:
         df = pd.DataFrame([{"key": key, "value": value}])
         ws_settings.update([df.columns.values.tolist()] + df.values.tolist())
         return
+
     if "key" not in df.columns or "value" not in df.columns:
         st.error("A settings tabnak 'key' és 'value' oszlop kell.")
         st.stop()
@@ -121,20 +122,15 @@ def set_setting(key: str, value: str) -> None:
     ws_settings.update([df.columns.values.tolist()] + df.values.tolist())
 
 def parse_iso_dt(s: str) -> datetime:
-    # várható: 2025-12-18T15:45:00 (timezone nélkül) vagy timezone-os
     s = (s or "").strip()
     if not s:
         raise ValueError("Empty datetime")
-    try:
-        dt = datetime.fromisoformat(s)
-    except Exception as e:
-        raise ValueError(f"Invalid ISO datetime: {s}") from e
-    # ha nincs tz, tekintsük UTC-nek (egyszerű és determinisztikus)
+    dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
-# ================== SHOPIFY ==================
+# ================== SHOPIFY HELPERS ==================
 def is_priority_item(title: str) -> bool:
     t = (title or "").lower()
     keywords = ["elsőbbségi", "elsobsegi", "priority", "express", "gyorsított", "gyorsitott"]
@@ -152,8 +148,6 @@ def envelope_type(qty: int) -> str:
     return "Nincs"
 
 def shopify_get_orders_since(baseline_dt: datetime, limit: int = 250):
-    # Shopify REST orders.json, baseline UTC
-    # created_at_min/max - iso8601
     created_min = baseline_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
     url = f"{BASE_URL}/orders.json"
     params = {
@@ -175,23 +169,13 @@ def cached_orders_since(baseline_iso: str):
 if "orders_rows" not in st.session_state:
     st.session_state.orders_rows = []
 
-if "last_sync_msg" not in st.session_state:
-    st.session_state.last_sync_msg = ""
-
 if "stock_tab_opened_once" not in st.session_state:
     st.session_state.stock_tab_opened_once = False
 
 # ================== CORE: APPLY SHOPIFY DELTAS ==================
 def apply_shopify_deductions(baseline_iso: str):
-    """
-    Baseline óta keletkezett Shopify orderekből:
-    - mosolap: -sum(quantity)
-    - boríték: -1 (env típus)
-    Csak olyan order_id-t dolgoz fel, ami még nincs a logban (source=shopify, source_id=order_id).
-    """
     baseline_dt = parse_iso_dt(baseline_iso)
 
-    # betöltés
     stock_df = load_stock_df()
     log_df = load_log_df()
 
@@ -201,7 +185,6 @@ def apply_shopify_deductions(baseline_iso: str):
 
     orders = cached_orders_since(baseline_iso)
 
-    # csak baseline UTÁN (Shopify created_at_min inclusive; mi szigorítunk > baseline)
     new_orders = []
     for o in orders:
         oid = str(o.get("id") or "")
@@ -214,7 +197,6 @@ def apply_shopify_deductions(baseline_iso: str):
         try:
             odt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
         except Exception:
-            # ha bármi gáz, kihagyjuk
             continue
         if odt <= baseline_dt:
             continue
@@ -222,62 +204,50 @@ def apply_shopify_deductions(baseline_iso: str):
         new_orders.append(o)
 
     if not new_orders:
-        return 0, 0, {}
+        return 0, 0, {"F16": 0, "H18": 0, "I19": 0, "K20": 0}
 
-    # aggregálás
-    total_mosolap_delta = 0
     env_counts = {"F16": 0, "H18": 0, "I19": 0, "K20": 0}
+    mosolap_used = 0
     ts = now_iso()
 
-    # segéd: készlet módosítás a df-ben
-    def add_to_stock(item_name: str, delta: int):
+    def ensure_item(item_name: str, item_type: str):
         nonlocal stock_df
-        idx = stock_df.index[stock_df["item_name"] == item_name].tolist()
-        if not idx:
-            # ha nincs a táblában, hozzáadjuk envelope-ként (mosolap már legyen)
+        if not (stock_df["item_name"] == item_name).any():
             stock_df = pd.concat([stock_df, pd.DataFrame([{
-                "item_type": "envelope" if item_name != "mosolap" else "mosolap",
+                "item_type": item_type,
                 "item_name": item_name,
                 "quantity": 0
             }])], ignore_index=True)
-            idx = stock_df.index[stock_df["item_name"] == item_name].tolist()
 
-        i = idx[0]
+    def add_to_stock(item_name: str, delta: int, item_type: str):
+        nonlocal stock_df
+        ensure_item(item_name, item_type)
+        i = stock_df.index[stock_df["item_name"] == item_name][0]
         stock_df.at[i, "quantity"] = int(stock_df.at[i, "quantity"]) + int(delta)
 
-    # feldolgozás
     for o in new_orders:
         oid = str(o.get("id") or "")
         name = o.get("name", "")
         items = o.get("line_items", []) or []
-
         filtered = [i for i in items if not is_priority_item(i.get("title", ""))]
 
-        # mosólap: quantity összege
-        mos_qty = sum(int(i.get("quantity", 0)) for i in filtered)
-        # boríték: a rendelés termékszáma alapján
-        env = envelope_type(mos_qty)
+        qty = sum(int(i.get("quantity", 0)) for i in filtered)
 
-        # mosólap levonás
-        if mos_qty > 0:
-            add_to_stock("mosolap", -mos_qty)
-            total_mosolap_delta += mos_qty  # pozitív fogyásként számoljuk
-            append_log(ts, "mosolap", -mos_qty, f"Auto Shopify ({name})", "shopify", oid)
+        if qty > 0:
+            add_to_stock("mosolap", -qty, "mosolap")
+            mosolap_used += qty
+            append_log(ts, "mosolap", -qty, f"Auto Shopify ({name})", "shopify", oid)
 
-        # boríték levonás
+        env = envelope_type(qty)
         if env in env_counts:
-            add_to_stock(env, -1)
+            add_to_stock(env, -1, "envelope")
             env_counts[env] += 1
             append_log(ts, env, -1, f"Auto Shopify ({name})", "shopify", oid)
 
-        # ha env == "Nincs", nem vonunk borítékot (vagy később dönthetsz másképp)
-
-    # mentés készlet
     stock_df["quantity"] = pd.to_numeric(stock_df["quantity"], errors="coerce").fillna(0).astype(int)
     write_stock_df(stock_df)
 
-    processed_orders = len(new_orders)
-    return processed_orders, total_mosolap_delta, env_counts
+    return len(new_orders), mosolap_used, env_counts
 
 # ================== UI ==================
 st.title("📦 Mosly – rendelés, boríték és készlet")
@@ -287,7 +257,6 @@ tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🔮 Előrejelzés", "📦 Készl
 # ---------- DASHBOARD ----------
 with tab1:
     st.caption("Elsőbbségi / priority szállítási tétel nem számít bele a termékszámba.")
-
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
         start = st.date_input("Kezdő dátum")
@@ -297,7 +266,6 @@ with tab1:
         fetch = st.button("🔄 Utolsó 250 rendelés lekérése", use_container_width=True)
 
     if fetch:
-        # egyszerű lekérés időintervallumra (nem baseline)
         url = (
             f"{BASE_URL}/orders.json"
             f"?status=any&limit=250"
@@ -365,16 +333,13 @@ with tab2:
 
 # ---------- STOCK ----------
 with tab3:
-    # Baseline megjelenítés + állítás
     st.subheader("⏱️ Baseline (utolsó „igaz készlet” időpont)")
 
     current_baseline = get_setting("baseline_datetime")
     if not current_baseline:
-        # ha üres, adjunk egy defaultot (most)
         current_baseline = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
         set_setting("baseline_datetime", current_baseline)
 
-    # UI: baseline editor
     try:
         baseline_dt = parse_iso_dt(current_baseline)
     except Exception:
@@ -388,29 +353,20 @@ with tab3:
     with b3:
         save_baseline = st.button("💾 Baseline mentése + azonnali szinkron", use_container_width=True)
 
-    # Készlet tab trigger: első megnyitáskor automatikus sync (plusz manuális gomb)
     sync_col1, sync_col2 = st.columns([2, 2])
     with sync_col1:
         manual_sync = st.button("🔄 Shopify → készlet szinkron (baseline óta)", use_container_width=True)
     with sync_col2:
-        st.write("")
-        st.caption("Trigger: Készlet fül megnyitása (első betöltés) vagy a fenti gombok.")
+        st.caption("Trigger: Készlet fül megnyitása (első betöltés) vagy gombok.")
 
-    # sync futtatás feltételek
     do_sync = False
-
-    # baseline mentés + sync
     if save_baseline:
-        combined = datetime.combine(new_base_date, new_base_time)
-        combined = combined.replace(tzinfo=timezone.utc)  # egyszerű: UTC
-        new_iso = combined.replace(microsecond=0).isoformat()
+        combined = datetime.combine(new_base_date, new_base_time).replace(tzinfo=timezone.utc).replace(microsecond=0)
+        new_iso = combined.isoformat()
         set_setting("baseline_datetime", new_iso)
-        # cache miatt:
         st.cache_data.clear()
         do_sync = True
-        st.session_state.last_sync_msg = f"Baseline beállítva: {new_iso}"
 
-    # első készlet-tab betöltéskor sync
     if not st.session_state.stock_tab_opened_once:
         st.session_state.stock_tab_opened_once = True
         do_sync = True
@@ -418,57 +374,48 @@ with tab3:
     if manual_sync:
         do_sync = True
 
-    # sync lefuttatása
     if do_sync:
         baseline_now = get_setting("baseline_datetime")
         try:
             with st.spinner("Shopify rendelések feldolgozása baseline óta..."):
                 processed_orders, mosolap_used, env_counts = apply_shopify_deductions(baseline_now)
-            parts = []
-            parts.append(f"✅ Feldolgozott új rendelések: {processed_orders} db")
-            if mosolap_used:
-                parts.append(f"🧺 Mosólap levonás: {mosolap_used} db")
             env_msg = ", ".join([f"{k}:{v}" for k, v in env_counts.items() if v > 0]) or "nincs"
-            parts.append(f"✉️ Boríték levonás: {env_msg}")
-            st.success(" | ".join(parts))
+            st.success(
+                f"✅ Új rendelések: {processed_orders} | "
+                f"🧺 Mosólap levonás: {mosolap_used} | "
+                f"✉️ Boríték: {env_msg}"
+            )
         except Exception as e:
             st.error(f"Szinkron hiba: {e}")
 
     st.markdown("---")
 
-    # Aktuális készlet
     st.subheader("📦 Aktuális készlet (Google Sheet)")
     stock_df = load_stock_df()
 
-    # Kiemelt készletkártyák
-    mos_qty = int(stock_df.loc[stock_df["item_name"] == "mosolap", "quantity"].values[0]) if (stock_df["item_name"] == "mosolap").any() else 0
-    f16 = int(stock_df.loc[stock_df["item_name"] == "F16", "quantity"].values[0]) if (stock_df["item_name"] == "F16").any() else 0
-    h18 = int(stock_df.loc[stock_df["item_name"] == "H18", "quantity"].values[0]) if (stock_df["item_name"] == "H18").any() else 0
-    i19 = int(stock_df.loc[stock_df["item_name"] == "I19", "quantity"].values[0]) if (stock_df["item_name"] == "I19").any() else 0
-    k20 = int(stock_df.loc[stock_df["item_name"] == "K20", "quantity"].values[0]) if (stock_df["item_name"] == "K20").any() else 0
+    def get_qty(name: str) -> int:
+        if (stock_df["item_name"] == name).any():
+            return int(stock_df.loc[stock_df["item_name"] == name, "quantity"].values[0])
+        return 0
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Mosólap", mos_qty)
-    m2.metric("F16", f16)
-    m3.metric("H18", h18)
-    m4.metric("I19", i19)
-    m5.metric("K20", k20)
+    m1.metric("Mosólap", get_qty("mosolap"))
+    m2.metric("F16", get_qty("F16"))
+    m3.metric("H18", get_qty("H18"))
+    m4.metric("I19", get_qty("I19"))
+    m5.metric("K20", get_qty("K20"))
 
     st.dataframe(stock_df, use_container_width=True)
 
     st.markdown("---")
 
-    # Manuális készletmódosítás + változtatás dátuma (baseline)
     st.subheader("🛠️ Manuális készletmódosítás (és baseline beállítás)")
-
     left, mid, right = st.columns([2, 1, 2])
 
     with left:
         item = st.selectbox("Tétel", stock_df["item_name"].tolist(), key="manual_item")
-
     with mid:
         amount = st.number_input("Mennyiség", min_value=1, step=1, key="manual_amount")
-
     with right:
         reason = st.text_input("Megjegyzés (kötelező)", placeholder="pl. Beérkezés, leltár, selejt", key="manual_reason")
 
@@ -478,46 +425,47 @@ with tab3:
     with d2:
         change_time = st.time_input("Változtatás ideje", value=datetime.now().time().replace(microsecond=0), key="change_time")
 
-    a1, a2 = st.columns(2)
-
     def apply_manual_delta(delta: int):
-        nonlocal stock_df
         if not reason.strip():
             st.error("Megjegyzés kötelező!")
             return
 
-        # készlet frissítés
-        idx = stock_df.index[stock_df["item_name"] == item].tolist()
-        if not idx:
+        # mindig frissen töltsük be a készletet
+        df = load_stock_df()
+
+        if not (df["item_name"] == item).any():
             st.error("Ismeretlen tétel a stock_current-ben.")
             return
-        i = idx[0]
-        new_qty = int(stock_df.at[i, "quantity"]) + int(delta)
-        stock_df.at[i, "quantity"] = new_qty
-        write_stock_df(stock_df)
 
-        # log
+        i = df.index[df["item_name"] == item][0]
+        df.at[i, "quantity"] = int(df.at[i, "quantity"]) + int(delta)
+        write_stock_df(df)
+
         ts = datetime.combine(change_date, change_time).replace(tzinfo=timezone.utc).replace(microsecond=0).isoformat()
         append_log(ts, item, delta, reason, "manual", "")
 
-        # baseline beállítás ugyanarra az időpontra + azonnali sync
+        # baseline = a manuális változtatás ideje
         set_setting("baseline_datetime", ts)
         st.cache_data.clear()
 
+        # azonnali sync
         with st.spinner("Baseline mentve, Shopify szinkron fut..."):
             processed_orders, mosolap_used, env_counts = apply_shopify_deductions(ts)
 
         env_msg = ", ".join([f"{k}:{v}" for k, v in env_counts.items() if v > 0]) or "nincs"
-        st.success(f"Mentve ({item} {delta:+d}). Baseline: {ts}. Új rendelések: {processed_orders}. Mosólap levonás: {mosolap_used}. Boríték: {env_msg}")
+        st.success(
+            f"Mentve ({item} {delta:+d}). Baseline: {ts}. "
+            f"Új rendelések: {processed_orders}. Mosólap levonás: {mosolap_used}. Boríték: {env_msg}"
+        )
         st.rerun()
 
+    a1, a2 = st.columns(2)
     with a1:
         if st.button("➕ Feltöltés", use_container_width=True):
             apply_manual_delta(int(amount))
 
     with a2:
         if st.button("➖ Levonás", use_container_width=True):
-            # opcionális: ne menjen mínuszba
             current_qty = int(stock_df.loc[stock_df["item_name"] == item, "quantity"].values[0])
             if amount > current_qty:
                 st.error("Nincs ennyi készleten!")
@@ -526,12 +474,9 @@ with tab3:
 
     st.markdown("---")
 
-    # Log megjelenítés
-    st.subheader("🧾 Készletmozgások (log)")
+    st.subheader("🧾 Készletmozgások (log) – utolsó 200 sor")
     log_df = load_log_df()
     if log_df.empty:
         st.info("Még nincs log bejegyzés.")
     else:
-        # legutóbbi 200 sor
-        view = log_df.tail(200).copy()
-        st.dataframe(view, use_container_width=True)
+        st.dataframe(log_df.tail(200), use_container_width=True)

@@ -138,15 +138,60 @@ with tab2:
 # ---------- KÉSZLET ----------
 with tab3:
     st.subheader("📦 Aktuális készlet")
+
     stock = load_stock()
     st.dataframe(stock, use_container_width=True)
 
-    st.subheader("➕ / ➖ Készlet módosítás")
-    item = st.selectbox("Tétel", stock["item_name"])
-    delta = st.number_input("Változás (+ / −)", value=0)
-    reason = st.text_input("Megjegyzés")
+    st.markdown("---")
+    st.subheader("🛠️ Készlet manuális kezelése")
 
-    if st.button("Mentés"):
-        update_stock(item, delta, reason)
-        st.success("Készlet frissítve")
-        st.rerun()
+    col1, col2, col3 = st.columns([2, 1, 2])
+
+    with col1:
+        item = st.selectbox(
+            "Tétel kiválasztása",
+            stock["item_name"].tolist()
+        )
+
+    with col2:
+        amount = st.number_input(
+            "Mennyiség",
+            min_value=1,
+            step=1
+        )
+
+    with col3:
+        reason = st.text_input(
+            "Megjegyzés (kötelező)",
+            placeholder="pl. Beérkezés, selejt, leltár korrekció"
+        )
+
+    col_add, col_sub = st.columns(2)
+
+    with col_add:
+        if st.button("➕ Készlet feltöltés", use_container_width=True):
+            if not reason.strip():
+                st.error("Megjegyzés kötelező!")
+            else:
+                update_stock(item, amount, reason)
+                st.success(f"{item}: +{amount} db hozzáadva")
+                st.rerun()
+
+    with col_sub:
+        if st.button("➖ Készlet levonás", use_container_width=True):
+            current_qty = int(
+                stock.loc[
+                    stock["item_name"] == item, "quantity"
+                ].values[0]
+            )
+
+            if amount > current_qty:
+                st.error("Nincs ennyi készleten!")
+            elif not reason.strip():
+                st.error("Megjegyzés kötelező!")
+            else:
+                update_stock(item, -amount, reason)
+                st.success(f"{item}: -{amount} db levonva")
+                st.rerun()
+
+

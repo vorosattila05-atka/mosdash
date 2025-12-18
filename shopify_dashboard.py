@@ -1,199 +1,152 @@
 # -*- coding: utf-8 -*-
 import streamlit as st
 import requests
+import json
+import pandas as pd
+from datetime import datetime
+import gspread
+from google.oauth2.service_account import Credentials
 
-st.set_page_config(
-    page_title="Mosly – Shopify Boríték Dashboard",
-    layout="wide"
-)
+st.set_page_config(page_title="Mosly – Dashboard", layout="wide")
 
-# ================== SECRETS BETÖLTÉS ==================
-def must_get_secret(key: str) -> str:
-    if key not in st.secrets or not str(st.secrets[key]).strip():
-        st.error(f"Hiányzó Secret: {key}")
+# ================== SECRETS ==================
+def secret(k):
+    if k not in st.secrets:
+        st.error(f"Hiányzó Secret: {k}")
         st.stop()
-    return str(st.secrets[key]).strip()
+    return st.secrets[k]
 
-APP_PASSWORD = must_get_secret("APP_PASSWORD")
-SHOPIFY_STORE = must_get_secret("SHOPIFY_STORE")
-SHOPIFY_API_KEY = must_get_secret("SHOPIFY_API_KEY")
-SHOPIFY_API_PASSWORD = must_get_secret("SHOPIFY_API_PASSWORD")
+APP_PASSWORD = secret("APP_PASSWORD")
+SHOPIFY_STORE = secret("SHOPIFY_STORE")
+SHOPIFY_API_KEY = secret("SHOPIFY_API_KEY")
+SHOPIFY_API_PASSWORD = secret("SHOPIFY_API_PASSWORD")
+GOOGLE_SHEET_ID = secret("GOOGLE_SHEET_ID")
+GOOGLE_SERVICE_ACCOUNT = json.loads(secret("GOOGLE_SERVICE_ACCOUNT"))
 
-BASE_URL = (
-    f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASSWORD}@"
-    f"{SHOPIFY_STORE}/admin/api/2024-10"
-)
+BASE_URL = f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASSWORD}@{SHOPIFY_STORE}/admin/api/2024-10"
 
-# ================== JELSZAVAS VÉDELEM ==================
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
+# ================== AUTH ==================
+if "auth" not in st.session_state:
+    st.session_state.auth = False
 
-if not st.session_state.authenticated:
+if not st.session_state.auth:
     st.title("🔒 Bejelentkezés")
     pw = st.text_input("Jelszó", type="password")
-
-    if pw:
-        if pw == APP_PASSWORD:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Hibás jelszó")
-
+    if pw == APP_PASSWORD:
+        st.session_state.auth = True
+        st.rerun()
+    elif pw:
+        st.error("Hibás jelszó")
     st.stop()
 
-# ================== SESSION STATE INIT ==================
-if "orders_data" not in st.session_state:
-    st.session_state.orders_data = []
+# ================== GOOGLE SHEET ==================
+@st.cache_resource
+def gs_client():
+    scope = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_info(
+        GOOGLE_SERVICE_ACCOUNT, scopes=scope
+    )
+    return gspread.authorize(creds)
 
-if "stats" not in st.session_state:
-    st.session_state.stats = {}
+gc = gs_client()
+sheet = gc.open_by_key(GOOGLE_SHEET_ID)
+ws_stock = sheet.worksheet("stock_current")
+ws_log = sheet.worksheet("stock_movements")
 
-if "avg_qty" not in st.session_state:
-    st.session_state.avg_qty = 0.0
+def load_stock():
+    return pd.DataFrame(ws_stock.get_all_records())
 
-# ================== SEGÉDFÜGGVÉNYEK ==================
-@st.cache_data(ttl=60)
-def get_orders(start_date: str, end_date: str):
+def update_stock(item_name, delta, reason):
+    df = load_stock()
+    df.loc[df["item_name"] == item_name, "quantity"] += delta
+    ws_stock.update([df.columns.values.tolist()] + df.values.tolist())
+    ws_log.append_row([
+        datetime.now().isoformat(),
+        item_name,
+        delta,
+        reason
+    ])
+
+# ================== SHOPIFY ==================
+@st.cache_data(ttl=120)
+def get_orders(start, end):
     url = (
         f"{BASE_URL}/orders.json"
-        f"?status=any"
-        f"&limit=250"
-        f"&created_at_min={start_date}T00:00:00-00:00"
-        f"&created_at_max={end_date}T23:59:59-00:00"
-        f"&order=created_at+desc"
+        f"?status=any&limit=250"
+        f"&created_at_min={start}T00:00:00"
+        f"&created_at_max={end}T23:59:59"
     )
-    r = requests.get(url, timeout=25)
+    r = requests.get(url)
     r.raise_for_status()
     return r.json().get("orders", [])
 
-def envelope_type(qty: int) -> str:
-    if qty == 1:
-        return "F16"
-    if qty in (2, 3):
-        return "H18"
-    if qty == 4:
-        return "I19"
-    if qty in (5, 6):
-        return "K20"
-    return "Nincs kategória"
+def env_type(q):
+    if q == 1: return "F16"
+    if q in (2,3): return "H18"
+    if q == 4: return "I19"
+    if q in (5,6): return "K20"
+    return "Nincs"
 
-def is_priority_item(title: str) -> bool:
-    t = (title or "").lower()
-    keywords = [
-        "elsőbbségi", "elsobsegi",
-        "priority", "express",
-        "gyorsított", "gyorsitott"
-    ]
-    return any(k in t for k in keywords)
+def is_priority(t):
+    t = t.lower()
+    return any(x in t for x in ["elsőbbségi","priority","express"])
 
 # ================== UI ==================
-st.title("📦 Mosly – Shopify rendelés & boríték dashboard")
-st.caption("Az elsőbbségi / priority szállítási tétel nem számít bele a termékszámba.")
+tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🔮 Előrejelzés", "📦 Készlet"])
 
-st.markdown("---")
+# ---------- DASHBOARD ----------
+with tab1:
+    c1, c2 = st.columns(2)
+    start = c1.date_input("Kezdő dátum")
+    end = c2.date_input("Végdátum")
 
-col1, col2, col3 = st.columns([1, 1, 1])
-with col1:
-    start_date = st.date_input("Kezdő dátum")
-with col2:
-    end_date = st.date_input("Végdátum")
-with col3:
-    fetch = st.button("🔄 Rendelések lekérése", use_container_width=True)
-
-# ================== RENDELÉSEK LEKÉRÉSE ==================
-if fetch:
-    with st.spinner("Shopify adatok lekérése..."):
-        try:
-            orders = get_orders(str(start_date), str(end_date))
-        except Exception as e:
-            st.error(f"Shopify API hiba: {e}")
-            st.stop()
-
-    st.session_state.orders_data = []
-    st.session_state.stats = {}
-
-    if not orders:
-        st.warning("Nincs rendelés ebben az időszakban.")
-    else:
-        for order in orders:
-            items = order.get("line_items", [])
-
-            filtered_items = [
-                i for i in items
-                if not is_priority_item(i.get("title", ""))
+    if st.button("Rendelések lekérése"):
+        orders = get_orders(str(start), str(end))
+        rows = []
+        for o in orders:
+            items = [
+                i for i in o["line_items"]
+                if not is_priority(i["title"])
             ]
-
-            qty = sum(int(i.get("quantity", 0)) for i in filtered_items)
-            env = envelope_type(qty)
-
-            st.session_state.orders_data.append({
-                "Rendelés": order.get("name"),
+            qty = sum(i["quantity"] for i in items)
+            rows.append({
+                "Rendelés": o["name"],
                 "Termékszám": qty,
-                "Boríték": env
+                "Boríték": env_type(qty)
             })
+        st.session_state.orders = rows
 
-        total_orders = len(st.session_state.orders_data)
-        total_qty = sum(o["Termékszám"] for o in st.session_state.orders_data)
-        st.session_state.avg_qty = total_qty / total_orders if total_orders else 0
+    if "orders" in st.session_state:
+        st.dataframe(pd.DataFrame(st.session_state.orders))
 
-        for o in st.session_state.orders_data:
-            st.session_state.stats[o["Boríték"]] = (
-                st.session_state.stats.get(o["Boríték"], 0) + 1
-            )
+# ---------- ELŐREJELZÉS ----------
+with tab2:
+    if "orders" not in st.session_state:
+        st.info("Előbb kérd le a rendeléseket")
+    else:
+        df = pd.DataFrame(st.session_state.orders)
+        avg = df["Termékszám"].mean()
+        incoming = st.number_input("Beérkező mosólap db", 1)
+        est = incoming / avg if avg else 0
+        st.metric("Becsült rendelések", round(est))
 
-# ================== MEGJELENÍTÉS ==================
-if st.session_state.orders_data:
+        counts = df["Boríték"].value_counts()
+        for env, c in counts.items():
+            if env != "Nincs":
+                st.write(env, round(c / len(df) * est))
 
-    st.subheader("📋 Rendelések")
-    st.dataframe(st.session_state.orders_data, use_container_width=True)
+# ---------- KÉSZLET ----------
+with tab3:
+    st.subheader("📦 Aktuális készlet")
+    stock = load_stock()
+    st.dataframe(stock, use_container_width=True)
 
-    st.subheader("📊 Boríték statisztika")
+    st.subheader("➕ / ➖ Készlet módosítás")
+    item = st.selectbox("Tétel", stock["item_name"])
+    delta = st.number_input("Változás (+ / −)", value=0)
+    reason = st.text_input("Megjegyzés")
 
-    total_orders = len(st.session_state.orders_data)
-    avg_qty = st.session_state.avg_qty
-
-    stats_sorted = sorted(
-        st.session_state.stats.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Összes rendelés", total_orders)
-    c2.metric("Átlagos termékszám", f"{avg_qty:.2f}")
-    c3.metric("Borítéktípusok", len(stats_sorted))
-
-    for env, count in stats_sorted:
-        percent = (count / total_orders * 100) if total_orders else 0
-        st.write(f"**{env}** → {count} db ({percent:.1f}%)")
-
-    st.markdown("---")
-
-    # ================== ELŐREJELZÉS ==================
-    st.subheader("🔮 Boríték előrejelzés")
-
-    incoming = st.number_input(
-        "Beérkező mosólap darabszám",
-        min_value=1,
-        step=1
-    )
-
-    if incoming and avg_qty > 0:
-        est_orders = incoming / avg_qty
-        st.write(f"**Becsült kiszolgálható rendelések:** {est_orders:.0f} db")
-
-        env_only = {
-            k: v for k, v in st.session_state.stats.items()
-            if k in ["F16", "H18", "I19", "K20"]
-        }
-
-        env_total = sum(env_only.values()) or 1
-
-        st.write("**Várható borítékigény:**")
-        for env, count in env_only.items():
-            ratio = count / env_total
-            need = round(ratio * est_orders)
-            st.write(f"- {env}: **{need} db**")
-
-else:
-    st.info("ℹ️ Először kérd le a rendeléseket a fenti dátum szűrővel.")
+    if st.button("Mentés"):
+        update_stock(item, delta, reason)
+        st.success("Készlet frissítve")
+        st.rerun()

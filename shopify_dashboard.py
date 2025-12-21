@@ -78,21 +78,21 @@ def latest_snapshot():
     if snap.empty:
         return None, {}
 
-    snap["_ts"] = pd.to_datetime(snap["datetime"], errors="coerce").astype("int64")
-    snap = snap.dropna(subset=["_ts"])
+    snap["dt"] = pd.to_datetime(snap["datetime"], errors="coerce")
+    snap = snap.dropna(subset=["dt"])
     if snap.empty:
         return None, {}
 
-    latest_ts = snap["_ts"].max()
+    latest_dt = snap["dt"].max().to_pydatetime()
     base = {}
 
-    for _, r in snap[snap["_ts"] == latest_ts].iterrows():
+    for _, r in snap[snap["dt"] == snap["dt"].max()].iterrows():
         base[str(r["item_name"])] = int(float(r["quantity"]))
 
-    return int(latest_ts), base
+    return latest_dt, base
 
 # ================= SHOPIFY ORDERS =================
-def shopify_orders_since(snapshot_ts):
+def shopify_orders_since(snapshot_dt):
     orders = []
     url = f"{BASE_URL}/orders.json"
 
@@ -102,8 +102,8 @@ def shopify_orders_since(snapshot_ts):
         "order": "created_at asc"
     }
 
-    if snapshot_ts is not None:
-        params["created_at_min"] = pd.to_datetime(snapshot_ts).isoformat()
+    if snapshot_dt is not None:
+        params["created_at_min"] = snapshot_dt.isoformat()
 
     while True:
         r = requests.get(url, params=params, timeout=30)
@@ -124,10 +124,10 @@ def update_orders_cache():
     orders_df = df(ws_orders)
     existing = set(orders_df["order_id"]) if not orders_df.empty else set()
 
-    snap_ts, _ = latest_snapshot()
+    snap_dt, _ = latest_snapshot()
     new_rows = []
 
-    for o in shopify_orders_since(snap_ts):
+    for o in shopify_orders_since(snap_dt):
         oid = str(o["id"])
         if oid in existing:
             continue
@@ -151,29 +151,31 @@ def update_orders_cache():
 
 # ================= CALCULATE STOCK =================
 def calculate_stock():
-    latest_ts, base = latest_snapshot()
+    latest_dt, base = latest_snapshot()
     result = dict(base)
 
     # ---- INCOMING ----
     incoming = df(ws_incoming)
-    if latest_ts is not None and not incoming.empty:
-        incoming["_ts"] = pd.to_datetime(incoming["datetime"], errors="coerce").astype("int64")
-        incoming = incoming.dropna(subset=["_ts"])
+    if latest_dt and not incoming.empty:
+        incoming["dt"] = pd.to_datetime(incoming["datetime"], errors="coerce")
+        incoming = incoming.dropna(subset=["dt"])
 
-        for _, r in incoming[incoming["_ts"] > latest_ts].iterrows():
-            result[r["item_name"]] = result.get(r["item_name"], 0) + int(float(r["quantity"]))
+        for _, r in incoming.iterrows():
+            if r["dt"].to_pydatetime() > latest_dt:
+                result[r["item_name"]] = result.get(r["item_name"], 0) + int(float(r["quantity"]))
 
     # ---- ORDERS ----
     orders = df(ws_orders)
-    if latest_ts is not None and not orders.empty:
-        orders["_ts"] = pd.to_datetime(orders["created_at"], errors="coerce").astype("int64")
-        orders = orders.dropna(subset=["_ts"])
+    if latest_dt and not orders.empty:
+        orders["dt"] = pd.to_datetime(orders["created_at"], errors="coerce")
+        orders = orders.dropna(subset=["dt"])
 
-        for _, r in orders[orders["_ts"] > latest_ts].iterrows():
-            if int(r["mosolap_qty"]) > 0:
-                result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
-            if r["envelope"]:
-                result[r["envelope"]] = result.get(r["envelope"], 0) - 1
+        for _, r in orders.iterrows():
+            if r["dt"].to_pydatetime() > latest_dt:
+                if int(r["mosolap_qty"]) > 0:
+                    result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
+                if r["envelope"]:
+                    result[r["envelope"]] = result.get(r["envelope"], 0) - 1
 
     out = pd.DataFrame(
         [{"item_name": k, "quantity": v} for k, v in result.items()]

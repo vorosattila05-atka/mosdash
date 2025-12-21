@@ -6,7 +6,6 @@ import json
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
-from urllib.parse import urlparse, parse_qs
 
 # ================= PAGE =================
 st.set_page_config(page_title="Mosly – Készlet", layout="wide")
@@ -78,40 +77,35 @@ def latest_snapshot_time():
     snap = df(ws_snap)
     if snap.empty:
         return None
-    snap["datetime"] = pd.to_datetime(snap["datetime"], errors="coerce")
-    snap = snap.dropna(subset=["datetime"])
+    snap["_dt"] = pd.to_datetime(snap["datetime"], errors="coerce")
+    snap = snap.dropna(subset=["_dt"])
     if snap.empty:
         return None
-    return snap["datetime"].max()
+    return snap["_dt"].max()
 
-# ================= SHOPIFY PAGINATION =================
+# ================= SHOPIFY ORDERS (PAGINATION) =================
 def shopify_orders_since(snapshot_dt):
     orders = []
+    url = f"{BASE_URL}/orders.json"
     params = {
         "status": "any",
         "limit": 250,
         "order": "created_at asc"
     }
-
     if snapshot_dt is not None:
         params["created_at_min"] = snapshot_dt.isoformat()
-
-    url = f"{BASE_URL}/orders.json"
 
     while True:
         r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
-        data = r.json().get("orders", [])
-        orders.extend(data)
+        orders.extend(r.json().get("orders", []))
 
         link = r.headers.get("Link")
         if not link or 'rel="next"' not in link:
             break
 
-        # next page URL
-        next_url = link.split(";")[0].strip("<>")
-        url = next_url
-        params = None  # next_url already has params
+        url = link.split(";")[0].strip("<>")
+        params = None
 
     return orders
 
@@ -149,26 +143,30 @@ def update_orders_cache():
 def calculate_stock():
     snap = df(ws_snap)
     base = {}
+    latest_time = None
 
     if not snap.empty:
-        snap["datetime"] = pd.to_datetime(snap["datetime"], errors="coerce")
-        latest_time = snap["datetime"].max()
-        latest = snap[snap["datetime"] == latest_time]
-        for _, r in latest.iterrows():
-            base[r["item_name"]] = int(float(r["quantity"]))
+        snap["_dt"] = pd.to_datetime(snap["datetime"], errors="coerce")
+        snap = snap.dropna(subset=["_dt"])
+        if not snap.empty:
+            latest_time = snap["_dt"].max()
+            for _, r in snap[snap["_dt"] == latest_time].iterrows():
+                base[r["item_name"]] = int(float(r["quantity"]))
 
     result = dict(base)
 
     incoming = df(ws_incoming)
-    if not incoming.empty:
-        incoming["datetime"] = pd.to_datetime(incoming["datetime"], errors="coerce")
-        for _, r in incoming[incoming["datetime"] > latest_time].iterrows():
+    if latest_time is not None and not incoming.empty:
+        incoming["_dt"] = pd.to_datetime(incoming["datetime"], errors="coerce")
+        incoming = incoming.dropna(subset=["_dt"])
+        for _, r in incoming[incoming["_dt"] > latest_time].iterrows():
             result[r["item_name"]] = result.get(r["item_name"], 0) + int(float(r["quantity"]))
 
     orders = df(ws_orders)
-    if not orders.empty:
-        orders["created_at"] = pd.to_datetime(orders["created_at"], errors="coerce")
-        for _, r in orders[orders["created_at"] > latest_time].iterrows():
+    if latest_time is not None and not orders.empty:
+        orders["_dt"] = pd.to_datetime(orders["created_at"], errors="coerce")
+        orders = orders.dropna(subset=["_dt"])
+        for _, r in orders[orders["_dt"] > latest_time].iterrows():
             if int(r["mosolap_qty"]) > 0:
                 result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
             if r["envelope"]:
@@ -195,7 +193,7 @@ with c1:
 with c2:
     if st.button("📊 Készlet újraszámolása"):
         with st.spinner("Számolás..."):
-            stock_df = calculate_stock()
+            calculate_stock()
         st.success("Készlet frissítve")
 
 st.markdown("---")
@@ -212,7 +210,7 @@ else:
 
 st.markdown("---")
 
-st.subheader("🧱 Készlet snapshot (helyreállítás)")
+st.subheader("🧱 Készlet snapshot")
 with st.form("snapshot"):
     sdt = st.datetime_input("Snapshot dátum és idő")
     sitem = st.text_input("Tétel")
@@ -224,7 +222,7 @@ with st.form("snapshot"):
 
 st.markdown("---")
 
-st.subheader("➕ Beérkezés rögzítése")
+st.subheader("➕ Beérkezés")
 with st.form("incoming"):
     dt = st.datetime_input("Dátum és idő")
     item = st.text_input("Tétel")

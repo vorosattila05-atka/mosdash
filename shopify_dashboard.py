@@ -6,7 +6,6 @@ import json
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
-import numpy as np
 
 # ================= PAGE =================
 st.set_page_config(page_title="Mosly – Készlet", layout="wide")
@@ -79,21 +78,21 @@ def latest_snapshot():
     if snap.empty:
         return None, {}
 
-    snap["_dt"] = pd.to_datetime(snap["datetime"], errors="coerce")
-    snap = snap.dropna(subset=["_dt"])
+    snap["_ts"] = pd.to_datetime(snap["datetime"], errors="coerce").astype("int64")
+    snap = snap.dropna(subset=["_ts"])
     if snap.empty:
         return None, {}
 
-    latest_time = pd.Timestamp(snap["_dt"].max())
+    latest_ts = snap["_ts"].max()
     base = {}
 
-    for _, r in snap[snap["_dt"] == latest_time].iterrows():
+    for _, r in snap[snap["_ts"] == latest_ts].iterrows():
         base[str(r["item_name"])] = int(float(r["quantity"]))
 
-    return latest_time, base
+    return int(latest_ts), base
 
 # ================= SHOPIFY ORDERS =================
-def shopify_orders_since(snapshot_dt):
+def shopify_orders_since(snapshot_ts):
     orders = []
     url = f"{BASE_URL}/orders.json"
 
@@ -102,8 +101,9 @@ def shopify_orders_since(snapshot_dt):
         "limit": 250,
         "order": "created_at asc"
     }
-    if snapshot_dt is not None:
-        params["created_at_min"] = snapshot_dt.isoformat()
+
+    if snapshot_ts is not None:
+        params["created_at_min"] = pd.to_datetime(snapshot_ts).isoformat()
 
     while True:
         r = requests.get(url, params=params, timeout=30)
@@ -124,10 +124,10 @@ def update_orders_cache():
     orders_df = df(ws_orders)
     existing = set(orders_df["order_id"]) if not orders_df.empty else set()
 
-    snap_time, _ = latest_snapshot()
+    snap_ts, _ = latest_snapshot()
     new_rows = []
 
-    for o in shopify_orders_since(snap_time):
+    for o in shopify_orders_since(snap_ts):
         oid = str(o["id"])
         if oid in existing:
             continue
@@ -151,27 +151,25 @@ def update_orders_cache():
 
 # ================= CALCULATE STOCK =================
 def calculate_stock():
-    latest_time, base = latest_snapshot()
+    latest_ts, base = latest_snapshot()
     result = dict(base)
 
     # ---- INCOMING ----
     incoming = df(ws_incoming)
-    if latest_time is not None and not incoming.empty:
-        incoming["_dt"] = pd.to_datetime(incoming["datetime"], errors="coerce")
-        incoming = incoming.dropna(subset=["_dt"])
+    if latest_ts is not None and not incoming.empty:
+        incoming["_ts"] = pd.to_datetime(incoming["datetime"], errors="coerce").astype("int64")
+        incoming = incoming.dropna(subset=["_ts"])
 
-        mask = incoming["_dt"].values > latest_time.to_numpy()
-        for _, r in incoming.loc[mask].iterrows():
+        for _, r in incoming[incoming["_ts"] > latest_ts].iterrows():
             result[r["item_name"]] = result.get(r["item_name"], 0) + int(float(r["quantity"]))
 
     # ---- ORDERS ----
     orders = df(ws_orders)
-    if latest_time is not None and not orders.empty:
-        orders["_dt"] = pd.to_datetime(orders["created_at"], errors="coerce")
-        orders = orders.dropna(subset=["_dt"])
+    if latest_ts is not None and not orders.empty:
+        orders["_ts"] = pd.to_datetime(orders["created_at"], errors="coerce").astype("int64")
+        orders = orders.dropna(subset=["_ts"])
 
-        mask = orders["_dt"].values > latest_time.to_numpy()
-        for _, r in orders.loc[mask].iterrows():
+        for _, r in orders[orders["_ts"] > latest_ts].iterrows():
             if int(r["mosolap_qty"]) > 0:
                 result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
             if r["envelope"]:
@@ -212,26 +210,3 @@ if not stock.empty:
     st.dataframe(stock, use_container_width=True)
 else:
     st.info("A készlet üres.")
-
-st.markdown("---")
-
-st.subheader("🧱 Készlet snapshot")
-with st.form("snapshot"):
-    sdt = st.datetime_input("Snapshot dátum és idő")
-    sitem = st.text_input("Tétel")
-    sqty = st.number_input("Mennyiség", min_value=0, step=1)
-    note = st.text_input("Megjegyzés")
-    if st.form_submit_button("Snapshot mentése"):
-        ws_snap.append_row([sdt.isoformat(), sitem, sqty, note])
-        st.success("Snapshot mentve")
-
-st.markdown("---")
-
-st.subheader("➕ Beérkezés")
-with st.form("incoming"):
-    dt = st.datetime_input("Dátum és idő")
-    item = st.text_input("Tétel")
-    qty = st.number_input("Mennyiség", min_value=1, step=1)
-    if st.form_submit_button("Mentés"):
-        ws_incoming.append_row([dt.isoformat(), item, qty])
-        st.success("Beérkezés mentve")

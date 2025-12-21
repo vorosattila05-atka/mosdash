@@ -51,9 +51,13 @@ book = gc.open_by_key(GOOGLE_SHEET_ID)
 ws_incoming = book.worksheet("stock_incoming")
 ws_stock = book.worksheet("stock_current")
 ws_orders = book.worksheet("orders_cache")
+ws_snap = book.worksheet("stock_snapshots")
 
 def df(ws):
-    return pd.DataFrame(ws.get_all_records())
+    data = ws.get_all_values()
+    if len(data) < 2:
+        return pd.DataFrame()
+    return pd.DataFrame(data[1:], columns=data[0])
 
 # ================= HELPERS =================
 def is_priority(title: str) -> bool:
@@ -75,11 +79,10 @@ def shopify_orders():
     r.raise_for_status()
     return r.json()["orders"]
 
-# ================= CACHE ORDERS =================
+# ================= ORDERS CACHE =================
 def update_orders_cache():
     orders_df = df(ws_orders)
-    existing = set(orders_df["order_id"].astype(str)) if not orders_df.empty else set()
-
+    existing = set(orders_df["order_id"]) if not orders_df.empty else set()
     new_rows = []
 
     for o in shopify_orders():
@@ -104,44 +107,65 @@ def update_orders_cache():
 
     return len(new_rows)
 
-# ================= CALC STOCK =================
+# ================= SNAPSHOT =================
+def latest_snapshot():
+    snap = df(ws_snap)
+    if snap.empty:
+        return None, {}
+    snap["datetime"] = pd.to_datetime(snap["datetime"])
+    latest_time = snap["datetime"].max()
+    latest = snap[snap["datetime"] == latest_time]
+    base = {}
+    for _, r in latest.iterrows():
+        base[r["item_name"]] = int(r["quantity"])
+    return latest_time, base
+
+# ================= CALCULATE STOCK =================
 def calculate_stock():
+    snap_time, base = latest_snapshot()
+
     incoming = df(ws_incoming)
     orders = df(ws_orders)
 
-    result = {}
+    result = dict(base)
 
-    for _, r in incoming.iterrows():
-        result[r["item_name"]] = result.get(r["item_name"], 0) + int(r["quantity"])
+    if not incoming.empty and snap_time is not None:
+        incoming["datetime"] = pd.to_datetime(incoming["datetime"])
+        inc = incoming[incoming["datetime"] > snap_time]
+        for _, r in inc.iterrows():
+            result[r["item_name"]] = result.get(r["item_name"], 0) + int(r["quantity"])
 
-    for _, r in orders.iterrows():
-        if r["mosolap_qty"]:
-            result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
-        if r["envelope"]:
-            result[r["envelope"]] = result.get(r["envelope"], 0) - 1
+    if not orders.empty and snap_time is not None:
+        orders["created_at"] = pd.to_datetime(orders["created_at"])
+        ords = orders[orders["created_at"] > snap_time]
+        for _, r in ords.iterrows():
+            if int(r["mosolap_qty"]) > 0:
+                result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
+            if r["envelope"]:
+                result[r["envelope"]] = result.get(r["envelope"], 0) - 1
 
     out = pd.DataFrame(
         [{"item_name": k, "quantity": v} for k, v in result.items()]
     )
 
     ws_stock.update([out.columns.tolist()] + out.values.tolist())
-    return out
+    return out, snap_time
 
 # ================= UI =================
 st.title("📦 Mosly – Aktuális készlet")
 
-col1, col2 = st.columns(2)
+c1, c2 = st.columns(2)
 
-with col1:
+with c1:
     if st.button("🔄 Shopify rendelések frissítése"):
-        with st.spinner("Shopify → orders_cache..."):
-            new = update_orders_cache()
-        st.success(f"{new} új rendelés eltárolva")
+        with st.spinner("Shopify → orders_cache"):
+            n = update_orders_cache()
+        st.success(f"{n} új rendelés eltárolva")
 
-with col2:
+with c2:
     if st.button("📊 Készlet újraszámolása"):
-        with st.spinner("Készlet számolása..."):
-            stock = calculate_stock()
+        with st.spinner("Számolás..."):
+            stock, snap_time = calculate_stock()
         st.success("Készlet frissítve")
 
 st.markdown("---")
@@ -151,21 +175,27 @@ if not stock.empty:
     cols = st.columns(len(stock))
     for i, r in stock.iterrows():
         cols[i].metric(r["item_name"], int(r["quantity"]))
-
-st.dataframe(stock, use_container_width=True)
+    st.dataframe(stock, use_container_width=True)
 
 st.markdown("---")
 
 st.subheader("➕ Beérkezés rögzítése")
-
 with st.form("incoming"):
     dt = st.datetime_input("Dátum")
     item = st.text_input("Tétel (mosolap / F16 / H18 / I19 / K20)")
     qty = st.number_input("Mennyiség", min_value=1, step=1)
-    submit = st.form_submit_button("Mentés")
-
-    if submit:
+    if st.form_submit_button("Mentés"):
         ws_incoming.append_row([dt.isoformat(), item, qty])
-        st.success("Beérkezés mentve – frissítsd a készletet")
+        st.success("Beérkezés mentve")
 
-st.caption("A készlet a beérkezésekből indul, az orders_cache csökkenti.")
+st.markdown("---")
+
+st.subheader("🧱 Készlet helyreállítás (Snapshot)")
+with st.form("snapshot"):
+    sdt = st.datetime_input("Snapshot dátum")
+    sitem = st.text_input("Tétel")
+    sqty = st.number_input("Mennyiség", min_value=0, step=1)
+    note = st.text_input("Megjegyzés")
+    if st.form_submit_button("Snapshot mentése"):
+        ws_snap.append_row([sdt.isoformat(), sitem, sqty, note])
+        st.success("Snapshot mentve – számold újra a készletet")

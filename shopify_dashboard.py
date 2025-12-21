@@ -55,17 +55,16 @@ ws_snap = book.worksheet("stock_snapshots")
 
 def df(ws):
     data = ws.get_all_values()
-    if not data or len(data) < 2:
+    if len(data) < 2:
         return pd.DataFrame()
-    d = pd.DataFrame(data[1:], columns=data[0])
-    return d.loc[:, ~d.columns.duplicated()]
+    return pd.DataFrame(data[1:], columns=data[0])
 
 # ================= HELPERS =================
-def is_priority(title: str) -> bool:
+def is_priority(title):
     t = (title or "").lower()
-    return any(k in t for k in ["elsőbbségi", "elsobsegi", "priority", "express"])
+    return any(x in t for x in ["elsőbbségi", "priority", "express"])
 
-def envelope_type(qty: int) -> str:
+def envelope_type(qty):
     if qty == 1: return "F16"
     if qty in (2, 3): return "H18"
     if qty == 4: return "I19"
@@ -78,32 +77,26 @@ def latest_snapshot():
     if snap.empty:
         return None, {}
 
-    snap["dt"] = pd.to_datetime(snap["datetime"], errors="coerce")
-    snap = snap.dropna(subset=["dt"])
-    if snap.empty:
-        return None, {}
+    snap = snap.dropna(subset=["datetime"])
+    latest_time = max(snap["datetime"])  # STRING
 
-    latest_dt = snap["dt"].max().to_pydatetime()
     base = {}
+    for _, r in snap[snap["datetime"] == latest_time].iterrows():
+        base[r["item_name"]] = int(float(r["quantity"]))
 
-    for _, r in snap[snap["dt"] == snap["dt"].max()].iterrows():
-        base[str(r["item_name"])] = int(float(r["quantity"]))
-
-    return latest_dt, base
+    return latest_time, base
 
 # ================= SHOPIFY ORDERS =================
-def shopify_orders_since(snapshot_dt):
+def shopify_orders_since(snapshot_iso):
     orders = []
     url = f"{BASE_URL}/orders.json"
-
     params = {
         "status": "any",
         "limit": 250,
         "order": "created_at asc"
     }
-
-    if snapshot_dt is not None:
-        params["created_at_min"] = snapshot_dt.isoformat()
+    if snapshot_iso:
+        params["created_at_min"] = snapshot_iso
 
     while True:
         r = requests.get(url, params=params, timeout=30)
@@ -124,10 +117,10 @@ def update_orders_cache():
     orders_df = df(ws_orders)
     existing = set(orders_df["order_id"]) if not orders_df.empty else set()
 
-    snap_dt, _ = latest_snapshot()
+    snapshot_iso, _ = latest_snapshot()
     new_rows = []
 
-    for o in shopify_orders_since(snap_dt):
+    for o in shopify_orders_since(snapshot_iso):
         oid = str(o["id"])
         if oid in existing:
             continue
@@ -140,8 +133,7 @@ def update_orders_cache():
             oid,
             o["created_at"],
             qty,
-            env,
-            datetime.utcnow().isoformat()
+            env
         ])
 
     if new_rows:
@@ -151,27 +143,19 @@ def update_orders_cache():
 
 # ================= CALCULATE STOCK =================
 def calculate_stock():
-    latest_dt, base = latest_snapshot()
+    snapshot_iso, base = latest_snapshot()
     result = dict(base)
 
-    # ---- INCOMING ----
     incoming = df(ws_incoming)
-    if latest_dt and not incoming.empty:
-        incoming["dt"] = pd.to_datetime(incoming["datetime"], errors="coerce")
-        incoming = incoming.dropna(subset=["dt"])
-
+    if snapshot_iso and not incoming.empty:
         for _, r in incoming.iterrows():
-            if r["dt"].to_pydatetime() > latest_dt:
+            if r["datetime"] > snapshot_iso:
                 result[r["item_name"]] = result.get(r["item_name"], 0) + int(float(r["quantity"]))
 
-    # ---- ORDERS ----
     orders = df(ws_orders)
-    if latest_dt and not orders.empty:
-        orders["dt"] = pd.to_datetime(orders["created_at"], errors="coerce")
-        orders = orders.dropna(subset=["dt"])
-
+    if snapshot_iso and not orders.empty:
         for _, r in orders.iterrows():
-            if r["dt"].to_pydatetime() > latest_dt:
+            if r["created_at"] > snapshot_iso:
                 if int(r["mosolap_qty"]) > 0:
                     result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
                 if r["envelope"]:
@@ -182,7 +166,6 @@ def calculate_stock():
     )
 
     ws_stock.update([out.columns.tolist()] + out.values.tolist())
-    return out
 
 # ================= UI =================
 st.title("📦 Mosly – Aktuális készlet")
@@ -191,14 +174,12 @@ c1, c2 = st.columns(2)
 
 with c1:
     if st.button("🔄 Shopify rendelések frissítése (snapshot óta)"):
-        with st.spinner("Shopify → orders_cache"):
-            n = update_orders_cache()
-        st.success(f"{n} új rendelés eltárolva")
+        n = update_orders_cache()
+        st.success(f"{n} új rendelés betöltve")
 
 with c2:
     if st.button("📊 Készlet újraszámolása"):
-        with st.spinner("Számolás..."):
-            calculate_stock()
+        calculate_stock()
         st.success("Készlet frissítve")
 
 st.markdown("---")
@@ -208,7 +189,7 @@ if not stock.empty:
     stock["quantity"] = pd.to_numeric(stock["quantity"], errors="coerce").fillna(0).astype(int)
     cols = st.columns(len(stock))
     for i, r in stock.iterrows():
-        cols[i].metric(str(r["item_name"]), int(r["quantity"]))
+        cols[i].metric(r["item_name"], r["quantity"])
     st.dataframe(stock, use_container_width=True)
 else:
-    st.info("A készlet üres.")
+    st.info("Nincs készletadat.")

@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
+from urllib.parse import urlparse, parse_qs
 
 # ================= PAGE =================
 st.set_page_config(page_title="Mosly – Készlet", layout="wide")
@@ -24,7 +25,7 @@ SHOPIFY_API_PASSWORD = S("SHOPIFY_API_PASSWORD")
 GOOGLE_SHEET_ID = S("GOOGLE_SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT = json.loads(S("GOOGLE_SERVICE_ACCOUNT"))
 
-SHOPIFY_BASE = f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASSWORD}@{SHOPIFY_STORE}/admin/api/2024-10"
+BASE_URL = f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASSWORD}@{SHOPIFY_STORE}/admin/api/2024-10"
 
 # ================= AUTH =================
 if "auth" not in st.session_state:
@@ -72,23 +73,59 @@ def envelope_type(qty: int) -> str:
     if qty in (5, 6): return "K20"
     return ""
 
-def shopify_orders():
-    r = requests.get(
-        f"{SHOPIFY_BASE}/orders.json?status=any&limit=250&order=created_at+asc",
-        timeout=30
-    )
-    r.raise_for_status()
-    return r.json().get("orders", [])
+# ================= SNAPSHOT =================
+def latest_snapshot_time():
+    snap = df(ws_snap)
+    if snap.empty:
+        return None
+    snap["datetime"] = pd.to_datetime(snap["datetime"], errors="coerce")
+    snap = snap.dropna(subset=["datetime"])
+    if snap.empty:
+        return None
+    return snap["datetime"].max()
+
+# ================= SHOPIFY PAGINATION =================
+def shopify_orders_since(snapshot_dt):
+    orders = []
+    params = {
+        "status": "any",
+        "limit": 250,
+        "order": "created_at asc"
+    }
+
+    if snapshot_dt is not None:
+        params["created_at_min"] = snapshot_dt.isoformat()
+
+    url = f"{BASE_URL}/orders.json"
+
+    while True:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json().get("orders", [])
+        orders.extend(data)
+
+        link = r.headers.get("Link")
+        if not link or 'rel="next"' not in link:
+            break
+
+        # next page URL
+        next_url = link.split(";")[0].strip("<>")
+        url = next_url
+        params = None  # next_url already has params
+
+    return orders
 
 # ================= ORDERS CACHE =================
 def update_orders_cache():
     orders_df = df(ws_orders)
-    existing = set(orders_df["order_id"]) if not orders_df.empty else set()
+    existing_ids = set(orders_df["order_id"]) if not orders_df.empty else set()
 
+    snap_dt = latest_snapshot_time()
     new_rows = []
-    for o in shopify_orders():
+
+    for o in shopify_orders_since(snap_dt):
         oid = str(o["id"])
-        if oid in existing:
+        if oid in existing_ids:
             continue
 
         items = [i for i in o["line_items"] if not is_priority(i["title"])]
@@ -108,50 +145,30 @@ def update_orders_cache():
 
     return len(new_rows)
 
-# ================= SNAPSHOT =================
-def latest_snapshot():
-    snap = df(ws_snap)
-    if snap.empty:
-        return None, {}
-
-    snap_dt = pd.to_datetime(snap["datetime"], errors="coerce")
-    snap_dt = snap_dt.apply(lambda x: x.replace(tzinfo=None) if pd.notna(x) else x)
-    snap = snap.assign(_dt=snap_dt).dropna(subset=["_dt"])
-
-    if snap.empty:
-        return None, {}
-
-    t = snap["_dt"].max()
-    latest = snap[snap["_dt"] == t]
-
-    base = {}
-    for _, r in latest.iterrows():
-        base[str(r["item_name"])] = int(float(r["quantity"]))
-
-    return t, base
-
 # ================= CALCULATE STOCK =================
 def calculate_stock():
-    snap_time, base = latest_snapshot()
+    snap = df(ws_snap)
+    base = {}
+
+    if not snap.empty:
+        snap["datetime"] = pd.to_datetime(snap["datetime"], errors="coerce")
+        latest_time = snap["datetime"].max()
+        latest = snap[snap["datetime"] == latest_time]
+        for _, r in latest.iterrows():
+            base[r["item_name"]] = int(float(r["quantity"]))
+
     result = dict(base)
 
     incoming = df(ws_incoming)
-    orders = df(ws_orders)
-
-    if snap_time is not None and not incoming.empty:
-        inc_dt = pd.to_datetime(incoming["datetime"], errors="coerce")
-        inc_dt = inc_dt.apply(lambda x: x.replace(tzinfo=None) if pd.notna(x) else x)
-        incoming = incoming.assign(_dt=inc_dt).dropna(subset=["_dt"])
-
-        for _, r in incoming[incoming["_dt"] > snap_time].iterrows():
+    if not incoming.empty:
+        incoming["datetime"] = pd.to_datetime(incoming["datetime"], errors="coerce")
+        for _, r in incoming[incoming["datetime"] > latest_time].iterrows():
             result[r["item_name"]] = result.get(r["item_name"], 0) + int(float(r["quantity"]))
 
-    if snap_time is not None and not orders.empty:
-        ord_dt = pd.to_datetime(orders["created_at"], errors="coerce")
-        ord_dt = ord_dt.apply(lambda x: x.replace(tzinfo=None) if pd.notna(x) else x)
-        orders = orders.assign(_dt=ord_dt).dropna(subset=["_dt"])
-
-        for _, r in orders[orders["_dt"] > snap_time].iterrows():
+    orders = df(ws_orders)
+    if not orders.empty:
+        orders["created_at"] = pd.to_datetime(orders["created_at"], errors="coerce")
+        for _, r in orders[orders["created_at"] > latest_time].iterrows():
             if int(r["mosolap_qty"]) > 0:
                 result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
             if r["envelope"]:
@@ -170,7 +187,7 @@ st.title("📦 Mosly – Aktuális készlet")
 c1, c2 = st.columns(2)
 
 with c1:
-    if st.button("🔄 Shopify rendelések frissítése"):
+    if st.button("🔄 Shopify rendelések frissítése (snapshot óta)"):
         with st.spinner("Shopify → orders_cache"):
             n = update_orders_cache()
         st.success(f"{n} új rendelés eltárolva")
@@ -195,6 +212,18 @@ else:
 
 st.markdown("---")
 
+st.subheader("🧱 Készlet snapshot (helyreállítás)")
+with st.form("snapshot"):
+    sdt = st.datetime_input("Snapshot dátum és idő")
+    sitem = st.text_input("Tétel")
+    sqty = st.number_input("Mennyiség", min_value=0, step=1)
+    note = st.text_input("Megjegyzés")
+    if st.form_submit_button("Snapshot mentése"):
+        ws_snap.append_row([sdt.isoformat(), sitem, sqty, note])
+        st.success("Snapshot mentve")
+
+st.markdown("---")
+
 st.subheader("➕ Beérkezés rögzítése")
 with st.form("incoming"):
     dt = st.datetime_input("Dátum és idő")
@@ -203,15 +232,3 @@ with st.form("incoming"):
     if st.form_submit_button("Mentés"):
         ws_incoming.append_row([dt.isoformat(), item, qty])
         st.success("Beérkezés mentve")
-
-st.markdown("---")
-
-st.subheader("🧱 Készlet helyreállítás (Snapshot)")
-with st.form("snapshot"):
-    sdt = st.datetime_input("Snapshot dátum és idő")
-    sitem = st.text_input("Tétel")
-    sqty = st.number_input("Mennyiség", min_value=0, step=1)
-    note = st.text_input("Megjegyzés")
-    if st.form_submit_button("Snapshot mentése"):
-        ws_snap.append_row([sdt.isoformat(), sitem, sqty, note])
-        st.success("Snapshot mentve – számold újra a készletet")

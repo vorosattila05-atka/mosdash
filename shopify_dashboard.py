@@ -57,8 +57,8 @@ def df(ws):
     data = ws.get_all_values()
     if not data or len(data) < 2:
         return pd.DataFrame()
-    df = pd.DataFrame(data[1:], columns=data[0])
-    return df.loc[:, ~df.columns.duplicated()]
+    d = pd.DataFrame(data[1:], columns=data[0])
+    return d.loc[:, ~d.columns.duplicated()]
 
 # ================= HELPERS =================
 def is_priority(title: str) -> bool:
@@ -73,25 +73,36 @@ def envelope_type(qty: int) -> str:
     return ""
 
 # ================= SNAPSHOT =================
-def latest_snapshot_time():
+def latest_snapshot():
     snap = df(ws_snap)
     if snap.empty:
-        return None
+        return None, {}
+
     snap["_dt"] = pd.to_datetime(snap["datetime"], errors="coerce")
     snap = snap.dropna(subset=["_dt"])
-    if snap.empty:
-        return None
-    return snap["_dt"].max()
 
-# ================= SHOPIFY ORDERS (PAGINATION) =================
+    if snap.empty:
+        return None, {}
+
+    latest_time = snap["_dt"].max()
+    base = {}
+
+    for _, r in snap[snap["_dt"] == latest_time].iterrows():
+        base[str(r["item_name"])] = int(float(r["quantity"]))
+
+    return latest_time, base
+
+# ================= SHOPIFY ORDERS =================
 def shopify_orders_since(snapshot_dt):
     orders = []
     url = f"{BASE_URL}/orders.json"
+
     params = {
         "status": "any",
         "limit": 250,
         "order": "created_at asc"
     }
+
     if snapshot_dt is not None:
         params["created_at_min"] = snapshot_dt.isoformat()
 
@@ -112,14 +123,14 @@ def shopify_orders_since(snapshot_dt):
 # ================= ORDERS CACHE =================
 def update_orders_cache():
     orders_df = df(ws_orders)
-    existing_ids = set(orders_df["order_id"]) if not orders_df.empty else set()
+    existing = set(orders_df["order_id"]) if not orders_df.empty else set()
 
-    snap_dt = latest_snapshot_time()
+    snap_time, _ = latest_snapshot()
     new_rows = []
 
-    for o in shopify_orders_since(snap_dt):
+    for o in shopify_orders_since(snap_time):
         oid = str(o["id"])
-        if oid in existing_ids:
+        if oid in existing:
             continue
 
         items = [i for i in o["line_items"] if not is_priority(i["title"])]
@@ -141,32 +152,27 @@ def update_orders_cache():
 
 # ================= CALCULATE STOCK =================
 def calculate_stock():
-    snap = df(ws_snap)
-    base = {}
-    latest_time = None
-
-    if not snap.empty:
-        snap["_dt"] = pd.to_datetime(snap["datetime"], errors="coerce")
-        snap = snap.dropna(subset=["_dt"])
-        if not snap.empty:
-            latest_time = snap["_dt"].max()
-            for _, r in snap[snap["_dt"] == latest_time].iterrows():
-                base[r["item_name"]] = int(float(r["quantity"]))
-
+    latest_time, base = latest_snapshot()
     result = dict(base)
 
+    # ---- INCOMING ----
     incoming = df(ws_incoming)
     if latest_time is not None and not incoming.empty:
         incoming["_dt"] = pd.to_datetime(incoming["datetime"], errors="coerce")
         incoming = incoming.dropna(subset=["_dt"])
-        for _, r in incoming[incoming["_dt"] > latest_time].iterrows():
+        incoming = incoming[incoming["_dt"] > latest_time]
+
+        for _, r in incoming.iterrows():
             result[r["item_name"]] = result.get(r["item_name"], 0) + int(float(r["quantity"]))
 
+    # ---- ORDERS ----
     orders = df(ws_orders)
     if latest_time is not None and not orders.empty:
         orders["_dt"] = pd.to_datetime(orders["created_at"], errors="coerce")
         orders = orders.dropna(subset=["_dt"])
-        for _, r in orders[orders["_dt"] > latest_time].iterrows():
+        orders = orders[orders["_dt"] > latest_time]
+
+        for _, r in orders.iterrows():
             if int(r["mosolap_qty"]) > 0:
                 result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
             if r["envelope"]:

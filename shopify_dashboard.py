@@ -42,9 +42,7 @@ if not st.session_state.auth:
 @st.cache_resource
 def gs_client():
     scope = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(
-        GOOGLE_SERVICE_ACCOUNT, scopes=scope
-    )
+    creds = Credentials.from_service_account_info(GOOGLE_SERVICE_ACCOUNT, scopes=scope)
     return gspread.authorize(creds)
 
 gc = gs_client()
@@ -116,18 +114,19 @@ def latest_snapshot():
     if snap.empty:
         return None, {}
 
-    snap["datetime"] = pd.to_datetime(snap["datetime"], errors="coerce").dt.tz_localize(None)
-    snap = snap.dropna(subset=["datetime"])
+    snap_dt = pd.to_datetime(snap["datetime"], errors="coerce")
+    snap_dt = snap_dt.apply(lambda x: x.replace(tzinfo=None) if pd.notna(x) else x)
+    snap = snap.assign(_dt=snap_dt).dropna(subset=["_dt"])
 
     if snap.empty:
         return None, {}
 
-    t = snap["datetime"].max()
-    latest = snap[snap["datetime"] == t]
+    t = snap["_dt"].max()
+    latest = snap[snap["_dt"] == t]
 
     base = {}
     for _, r in latest.iterrows():
-        base[r["item_name"]] = int(float(r["quantity"]))
+        base[str(r["item_name"])] = int(float(r["quantity"]))
 
     return t, base
 
@@ -140,13 +139,19 @@ def calculate_stock():
     orders = df(ws_orders)
 
     if snap_time is not None and not incoming.empty:
-        incoming["datetime"] = pd.to_datetime(incoming["datetime"], errors="coerce").dt.tz_localize(None)
-        for _, r in incoming[incoming["datetime"] > snap_time].iterrows():
+        inc_dt = pd.to_datetime(incoming["datetime"], errors="coerce")
+        inc_dt = inc_dt.apply(lambda x: x.replace(tzinfo=None) if pd.notna(x) else x)
+        incoming = incoming.assign(_dt=inc_dt).dropna(subset=["_dt"])
+
+        for _, r in incoming[incoming["_dt"] > snap_time].iterrows():
             result[r["item_name"]] = result.get(r["item_name"], 0) + int(float(r["quantity"]))
 
     if snap_time is not None and not orders.empty:
-        orders["created_at"] = pd.to_datetime(orders["created_at"], errors="coerce").dt.tz_localize(None)
-        for _, r in orders[orders["created_at"] > snap_time].iterrows():
+        ord_dt = pd.to_datetime(orders["created_at"], errors="coerce")
+        ord_dt = ord_dt.apply(lambda x: x.replace(tzinfo=None) if pd.notna(x) else x)
+        orders = orders.assign(_dt=ord_dt).dropna(subset=["_dt"])
+
+        for _, r in orders[orders["_dt"] > snap_time].iterrows():
             if int(r["mosolap_qty"]) > 0:
                 result["mosolap"] = result.get("mosolap", 0) - int(r["mosolap_qty"])
             if r["envelope"]:
